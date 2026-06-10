@@ -1,137 +1,118 @@
 #include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+#include <ArduinoJson.h>
+
+#include "config.h"
+#include "pins.h"
+#include "valve_controller.h"
 
 namespace {
 
 constexpr uint32_t SERIAL_BAUD = 115200;
-constexpr uint32_t MODEM_BAUD = 115200;
-constexpr uint32_t MODEM_TIMEOUT_MS = 2000;
 constexpr uint32_t PACKET_INTERVAL_MS = 10000;
 
-// XIAO ESP32C3 default UART pins from the board variant.
-constexpr uint8_t PIN_RYLR998_TX = D6;
-constexpr uint8_t PIN_RYLR998_RX = D7;
+SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 
-constexpr uint32_t LORA_BAND_HZ = 915000000;
-constexpr uint8_t LORA_SPREADING_FACTOR = 9;
-constexpr uint8_t LORA_BANDWIDTH_CODE = 7;   // 125 kHz on RYLR998
-constexpr uint8_t LORA_CODING_RATE_CODE = 3; // 4/7 on RYLR998
-constexpr uint8_t LORA_PREAMBLE = 12;
-constexpr uint16_t LORA_ADDRESS = 1;
-constexpr uint8_t LORA_NETWORK_ID = 18;
-
-const char *TEST_PAYLOAD = "iot-lora-transmitter test packet";
-
-HardwareSerial modemSerial(1);
-uint32_t packetCounter = 0;
+bool loraReady = false;
+bool mcpReady = false;
+uint32_t packetSeq = 0;
 uint32_t lastPacketMs = 0;
 
-String readLineFromModem(uint32_t timeoutMs) {
-  String response;
-  const uint32_t startMs = millis();
+bool setupLoRa() {
+  radio.setRfSwitchPins(PIN_LORA_RXEN, RADIOLIB_NC);
 
-  while (millis() - startMs < timeoutMs) {
-    while (modemSerial.available() > 0) {
-      const char ch = static_cast<char>(modemSerial.read());
-      if (ch == '\r') {
-        continue;
-      }
-      if (ch == '\n') {
-        if (!response.isEmpty()) {
-          response.trim();
-          return response;
-        }
-        continue;
-      }
-      response += ch;
-    }
-    delay(5);
-  }
+  int state = radio.begin(LORA_FREQUENCY_MHZ, LORA_BANDWIDTH_KHZ, LORA_SPREADING_FACTOR,
+                           LORA_CODING_RATE, LORA_SYNC_WORD, LORA_OUTPUT_POWER_DBM,
+                           LORA_PREAMBLE_LENGTH, LORA_TCXO_VOLTAGE);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setDio2AsRfSwitch(true);
 
-  response.trim();
-  return response;
-}
-
-void drainModemInput() {
-  while (modemSerial.available() > 0) {
-    modemSerial.read();
-  }
-}
-
-bool sendCommand(const String &command, const char *expected = "+OK",
-                 uint32_t timeoutMs = MODEM_TIMEOUT_MS) {
-  drainModemInput();
-
-  Serial.print("MODEM << ");
-  Serial.println(command);
-  modemSerial.print(command);
-  modemSerial.print("\r\n");
-
-  const uint32_t startMs = millis();
-  while (millis() - startMs < timeoutMs) {
-    const String line = readLineFromModem(timeoutMs);
-    if (line.isEmpty()) {
-      continue;
-    }
-
-    Serial.print("MODEM >> ");
-    Serial.println(line);
-
-    if (line.equals(expected)) {
-      return true;
-    }
-
-    if (line.startsWith("+ERR")) {
-      return false;
-    }
-  }
-
-  Serial.println("MODEM >> timeout");
-  return false;
-}
-
-bool setupModem() {
-  Serial.println("Configuring RYLR998...");
-
-  if (!sendCommand("AT")) {
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("LoRa init failed, code ");
+    Serial.println(state);
     return false;
   }
 
-  if (!sendCommand("AT+BAND=" + String(LORA_BAND_HZ))) {
-    return false;
-  }
-
-  if (!sendCommand("AT+ADDRESS=" + String(LORA_ADDRESS))) {
-    return false;
-  }
-
-  if (!sendCommand("AT+NETWORKID=" + String(LORA_NETWORK_ID))) {
-    return false;
-  }
-
-  const String parameterCommand =
-      "AT+PARAMETER=" + String(LORA_SPREADING_FACTOR) + "," +
-      String(LORA_BANDWIDTH_CODE) + "," + String(LORA_CODING_RATE_CODE) + "," +
-      String(LORA_PREAMBLE);
-
-  if (!sendCommand(parameterCommand)) {
-    return false;
-  }
-
+  Serial.println("LoRa ready: 915.0 MHz, SF9, BW125, CR 4/7, SW 0x12");
   return true;
 }
 
-bool sendTestPacket() {
-  const String payload = String(TEST_PAYLOAD) + " #" + String(packetCounter);
-  const String command = "AT+SEND=0," + String(payload.length()) + "," + payload;
+bool sendStatePacket() {
+  StaticJsonDocument<128> doc;
+  doc["node_id"] = NODE_ID;
+  doc["type"] = "state";
+  doc["seq"] = packetSeq;
 
-  if (!sendCommand(command)) {
+  String payload;
+  serializeJson(doc, payload);
+
+  const int state = radio.transmit(payload);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("LoRa TX failed, code ");
+    Serial.println(state);
     return false;
   }
 
   Serial.print("LoRa TX OK: ");
   Serial.println(payload);
-  ++packetCounter;
+  ++packetSeq;
   return true;
+}
+
+// Serial test harness for bench-testing the valve controller without the
+// radio link: "open <1..NUM_VALVES> <seconds>" / "close <1..NUM_VALVES>".
+void handleSerialCommand(const String& line) {
+  if (!mcpReady) {
+    Serial.println("mcp23017 not ready, ignoring command");
+    return;
+  }
+
+  int firstSpace = line.indexOf(' ');
+  String cmd = firstSpace < 0 ? line : line.substring(0, firstSpace);
+
+  if (cmd == "open") {
+    int secondSpace = line.indexOf(' ', firstSpace + 1);
+    if (firstSpace < 0 || secondSpace < 0) {
+      Serial.println("usage: open <1-" + String(NUM_VALVES) + "> <seconds>");
+      return;
+    }
+    int valveNum = line.substring(firstSpace + 1, secondSpace).toInt();
+    long durationS = line.substring(secondSpace + 1).toInt();
+    if (valveNum < 1 || valveNum > NUM_VALVES || durationS <= 0) {
+      Serial.println("usage: open <1-" + String(NUM_VALVES) + "> <seconds>");
+      return;
+    }
+    valve_controller::openWithTimer(valveNum - 1, static_cast<uint32_t>(durationS));
+    Serial.println("opened valve " + String(valveNum) + " for " + String(durationS) + "s");
+  } else if (cmd == "close") {
+    if (firstSpace < 0) {
+      Serial.println("usage: close <1-" + String(NUM_VALVES) + ">");
+      return;
+    }
+    int valveNum = line.substring(firstSpace + 1).toInt();
+    if (valveNum < 1 || valveNum > NUM_VALVES) {
+      Serial.println("usage: close <1-" + String(NUM_VALVES) + ">");
+      return;
+    }
+    valve_controller::close(valveNum - 1);
+    Serial.println("closed valve " + String(valveNum));
+  } else {
+    Serial.println("unknown command: " + line);
+  }
+}
+
+void pollSerial() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      line.trim();
+      if (line.length() > 0) handleSerialCommand(line);
+      line = "";
+    } else {
+      line += c;
+    }
+  }
 }
 
 } // namespace
@@ -141,33 +122,26 @@ void setup() {
   delay(1200);
 
   Serial.println();
-  Serial.println("iot-lora-transmitter bring-up");
-  Serial.printf("RYLR998 UART TX=%u RX=%u\n", PIN_RYLR998_TX, PIN_RYLR998_RX);
+  Serial.println("iot-lt-valve-controller bring-up");
 
-  modemSerial.begin(MODEM_BAUD, SERIAL_8N1, PIN_RYLR998_RX, PIN_RYLR998_TX);
-  delay(200);
-
-  if (!setupModem()) {
-    Serial.println("RYLR998 setup failed. Check power, UART wiring, and baud rate.");
-    return;
+  mcpReady = valve_controller::init();
+  if (!mcpReady) {
+    Serial.println("valve_controller::init() failed (MCP23017 not found)");
   }
 
-  Serial.println("RYLR998 ready");
-  sendTestPacket();
-  lastPacketMs = millis();
+  loraReady = setupLoRa();
+  if (loraReady) {
+    sendStatePacket();
+    lastPacketMs = millis();
+  }
 }
 
 void loop() {
-  if (millis() - lastPacketMs >= PACKET_INTERVAL_MS) {
-    lastPacketMs = millis();
-    if (!sendTestPacket()) {
-      Serial.println("LoRa TX failed");
-    }
-  }
+  pollSerial();
+  valve_controller::tick(millis());
 
-  const String line = readLineFromModem(20);
-  if (!line.isEmpty()) {
-    Serial.print("MODEM >> ");
-    Serial.println(line);
+  if (loraReady && millis() - lastPacketMs >= PACKET_INTERVAL_MS) {
+    lastPacketMs = millis();
+    sendStatePacket();
   }
 }
